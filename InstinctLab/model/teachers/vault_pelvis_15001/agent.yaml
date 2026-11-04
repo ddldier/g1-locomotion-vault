@@ -1,0 +1,46 @@
+seed: 42
+device: cuda:0
+num_steps_per_env: 24
+max_iterations: 15001
+ckpt_manipulator: null
+policy:
+  class_name: ActorCritic
+  init_noise_std: 1.0
+  actor_hidden_dims:
+  - 512
+  - 256
+  - 128
+  critic_hidden_dims:
+  - 512
+  - 256
+  - 128
+  activation: elu
+algorithm:
+  class_name: PPO
+  value_loss_coef: 1.0
+  use_clipped_value_loss: true
+  clip_param: 0.2
+  entropy_coef: 0.005
+  num_learning_epochs: 5
+  num_mini_batches: 4
+  learning_rate: 0.001
+  optimizer_class_name: AdamW
+  schedule: adaptive
+  gamma: 0.99
+  lam: 0.95
+  advantage_mixing_weights: 1.0
+  desired_kl: 0.01
+  max_grad_norm: 1.0
+  clip_min_std: 1.0e-12
+save_interval: 1000
+log_interval: 10
+experiment_name: g1_perceptive_vault_shadowing
+run_name: ''
+resume: false
+load_run: null
+load_checkpoint: model_.*.pt
+normalizers:
+  policy:
+    class_name: EmpiricalNormalization
+  critic:
+    class_name: EmpiricalNormalization

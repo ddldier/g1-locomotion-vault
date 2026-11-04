@@ -1,0 +1,6 @@
+selected_files:
+  - g1_speed_vault_retargeted.npz
+
+# 使用当前 InstinctLab loader 支持的独立权重列表。
+motion_weights:
+  - 1.0
