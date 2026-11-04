@@ -16,14 +16,15 @@ release.
 
 The original training logs and TensorBoard event files are not included. The
 `model/` directory contains the checkpoints needed to inspect the main policy
-lineage. Each checkpoint is below GitHub's 100 MB per-file limit; Git LFS is
-not required for this snapshot.
+lineage. The original InstinctLab attributes store the four checkpoints and
+one PNG asset in Git LFS; install Git LFS before cloning to fetch their data.
 
 ## Requirements and installation
 
 - Clone the combined repository:
 
 ```bash
+git lfs install
 git clone git@github.com:ddldier/g1-locomotion-vault.git
 cd g1-locomotion-vault
 ```
