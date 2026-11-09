@@ -9,7 +9,6 @@
 | `teachers/locomotion_pelvis_35000/` | `model_35000.pt` | pelvis-root locomotion Teacher | `logs/instinct_rl/g1_unified_omni_loco_pelvis_rev10/20261021_101015_G1UnifiedOmniLocoPelvisRev10_obs623_scale1_stand02_from24000_from20261020_115051/` |
 | `teachers/vault_pelvis_15001/` | `model_15001.pt` | pelvis-root Vault Teacher | `logs/instinct_rl/g1_perceptive_vault_pelvis_corrected/20261019_192913_g1PerceptiveVaultPelvisPhpTeacher_concatMotionBins/` |
 | `student/autonomous_dagger_vault1ms_14000/` | `model_14000.pt` | 双 Teacher DAgger 的视觉 Student | `logs/instinct_rl/g1_loco_vault_autonomous_dagger_vault1ms/20261023_230856_g1_loco_vault_autonomous_dagger/` |
-| `ppo/transition_1502/` | `model_1502.pt` | 高度扫描历史观测的 Walk/Vault/Recovery PPO | `logs/instinct_rl/g1_unified_transition_ppo_xonly_no_upright/20261104_170358_g1_unified_transition_ppo_critic_warmup_from20261104_154802/` |
 
 每个目录中的 `agent.yaml` 和 `env.yaml` 是对应 checkpoint 保存时的训练配置。`model_*.pt` 中还包含网络参数、训练状态和运行时使用的归一化器；只分析网络时优先读取 checkpoint，复现环境时同时读取同目录 YAML。
 
@@ -22,8 +21,6 @@ Vault Teacher (pelvis, model_15001.pt) ──────┘
 ```
 
 当前 DAgger runner 在 `source/instinctlab/instinctlab/tasks/shadowing/perceptive/config/g1/agents/instinct_rl_vault_dagger_cfg.py` 中引用这两个 Teacher。代码也支持用环境变量 `LOCOMOTION_TEACHER_CHECKPOINT` 和 `VAULT_TEACHER_CHECKPOINT` 覆盖路径。
-
-公开仓库副本默认从本目录的 `teachers/` 读取两个 Teacher，不需要原机器的绝对日志路径。PPO `transition_1502` 是后续独立实验，Actor 使用高度扫描历史；它与上表的深度相机 DAgger Student 不是同一份观测配置。PPO checkpoint 的 `env.yaml` / `agent.yaml` 保留训练时原始参数，播放时请使用当前代码配置，不要指定 `--env_cfg`。
 
 ## 3. 观测和速度约定
 
@@ -51,6 +48,10 @@ Vault Teacher (pelvis, model_15001.pt) ──────┘
 find model -type f -printf '%p %s bytes\\n' | sort
 sha256sum model/teachers/locomotion_pelvis_35000/model_35000.pt \\
            model/teachers/vault_pelvis_15001/model_15001.pt \\
-           model/student/autonomous_dagger_vault1ms_14000/model_14000.pt \\
-           model/ppo/transition_1502/model_1502.pt
+           model/student/autonomous_dagger_vault1ms_14000/model_14000.pt
 ```
+
+你现在选用的 Reward Switching 基准模型 model_1502.pt 保存在：
+
+/root/gpufree-data/InstinctLab/logs/instinct_rl/g1_transition_reward_switch/20261106_175734_g1_unified_transition_ppo_reward_switch_joint_from20261106_173550/model_1502.pt
+
