@@ -123,5 +123,5 @@ This repository does not include the Isaac Lab or Isaac Sim source trees.
 
 ## Locomotion and Vault Videos
 
-- [Video 1](loco_vault_video_01.mp4)
-- [Video 2](loco_vault_video_02.webm)
+- [Video 1](docs/showcase/loco-vault/loco_vault_video_01.mp4)
+- [Video 2](docs/showcase/loco-vault/loco_vault_video_02.webm)
