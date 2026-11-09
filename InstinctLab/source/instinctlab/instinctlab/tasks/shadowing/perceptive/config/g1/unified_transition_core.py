@@ -24,7 +24,7 @@ class TransitionSettings:
     vault_entry_distance: float = 0.7        # "翻越段"判定距离（箱子前方多近开始算进入 vault）
     rear_margin: float = 0.15                # 越过箱子后需要额外超出后沿的余量
     min_base_height: float = 0.35            # 基座最低允许高度，低于此值判定失败
-    max_episode_s: float = 12.0              # 单个 episode 最长时长（秒）
+    max_episode_s: float = 20.0              # 单个 episode 最长时长（秒）
     forward_command: float = 1.0             # 默认前进速度指令（m/s）
     box_force_threshold: float = 40.0        # 判定"非法箱体接触"的力阈值（N）
     ground_force_threshold: float = 40.0     # 判定"非法地面接触"的力阈值（N）
@@ -108,6 +108,7 @@ class TransitionState:
                      "recovery_seed",       # 是否为"恢复起点"（有障碍且 RSI，且初始 x 在箱子后方）
                      "ever_front",          # 是否曾经位于箱子前方（且当时在赛道内）
                      "seen_over",           # 是否曾从箱子上方"看到/越过"（高度超过箱顶+0.18）
+                     "vault_started",       # jin guo vault
                      "touched_box",         # 是否发生过合法的箱体接触（踩上箱子）
                      "crossed",             # 是否成功越过箱子后沿
                      "completed",           # 是否完成恢复稳定（满足恢复保持时长）
@@ -297,7 +298,8 @@ class TransitionState:
         self.completed |= active & completion
         # "完整成功"= 完整起点 + 已越过 + 完成
         self.full_success |= active & completion & self.full_start & self.crossed
-
+        enter_vault = (h & ~self.crossed & ~self.failed & (x >= front - self.cfg.vault_entry_distance))
+        self.vault_started |= active & enter_vault
         # 6.13) 阶段更新（0/1/2/3）
         stage = torch.zeros_like(self.stage)
         stage[h & (x >= front-self.cfg.approach_distance)] = 1   # 进入接近段
@@ -306,7 +308,7 @@ class TransitionState:
         self.stage[active] = stage[active]
 
         # 6.14) 接近段前进速率（仅当在接近段、尚未失败、在赛道内时记录）
-        approach = h & (self.prev_x < front) & (x < front) & in_lane & ~self.failed
+        approach = h & (self.prev_x < front) & (x < front - self.cfg.vault_entry_distance) & in_lane & ~self.failed
         delta = (x-self.prev_x).clamp(-0.2,0.2)   # 限制单步位移，防止异常跳变
         self.approach_rate[active] = torch.where(approach,delta/dt,0.)[active]
 
@@ -325,8 +327,12 @@ class TransitionState:
         #      速度奖励：一个较宽的速度带，越接近 (speed_error=0.35, 转向误差=0) 越好
         speed = torch.exp(-((speed_error-0.35).clamp_min(0.)/0.7).square()
                           -((ang_vel[:,2]-command[:,2]).abs()/0.8).square())
-        self.speed_reward[active] = torch.where(stage!=2,speed,0.)[active]
-
+        speed_enabled = (
+            ~self.vault_started
+            | self.crossed
+            | self.recovery_seed
+        )
+        self.speed_reward[active] = torch.where(speed_enabled,speed,0.)[active]
         # 6.18) 无障碍 episode 的异常判定：基座过高或倾斜过大
         self.no_obstacle_excursion |= active & ~h & ((base_height>0.95)|(gravity_z>-0.65))
 

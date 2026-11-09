@@ -2,8 +2,10 @@
 from pathlib import Path
 import numpy as np
 import torch
+from isaaclab.envs import mdp as isaac_mdp
 from .unified_transition_core import TransitionState, box_local, quat_multiply
-
+import isaaclab_tasks.manager_based.locomotion.velocity.mdp as velocity_mdp
+import instinctlab.tasks.locomotion.mdp as locomotion_mdp
 LEGAL_BODIES = (
     "left_ankle_roll_link", "right_ankle_roll_link",
     "left_wrist_roll_link", "left_wrist_pitch_link", "left_wrist_yaw_link",
@@ -95,16 +97,236 @@ def motion(env):
         env._transition_motion = ResetMotion(cfg.motion_file or default_motion_file(),
                                               env.scene["robot"].joint_names,env.device,cfg.frame_range)
     return env._transition_motion
+class _FrozenDaggerNormalizer(torch.nn.Module):
+    """Frozen EmpiricalNormalization loaded from DAgger checkpoint."""
+    def __init__(self):
+        super().__init__()
+        self.eps = 1e-2
+        self.register_buffer(
+            "_mean", torch.zeros(1, 2049)
+        )
+        self.register_buffer(
+            "_var", torch.ones(1, 2049)
+        )
+        self.register_buffer(
+            "_std", torch.ones(1, 2049)
+        )
+        self.register_buffer(
+            "count", torch.tensor(0, dtype=torch.long)
+        )
+    def forward(self, x):
+        return (x - self._mean) / (self._std + self.eps)
+    
+def load_vault_dagger_reference(env, checkpoint_path):
+    """Load and cache the frozen multi-frame DAgger Student."""
+    path = str(Path(checkpoint_path).expanduser())
+    cached = getattr(env, "_vault_dagger_reference", None)
+    if cached is not None and cached["path"] == path:
+        return cached["actor"], cached["normalizer"]
+    if not Path(path).is_file():
+        raise FileNotFoundError(path)
+    ckpt = torch.load(
+        path,
+        map_location="cpu",
+        weights_only=False,
+    )
+    actor = torch.nn.Sequential(
+        torch.nn.Linear(2049, 512),
+        torch.nn.ELU(),
+        torch.nn.Linear(512, 256),
+        torch.nn.ELU(),
+        torch.nn.Linear(256, 128),
+        torch.nn.ELU(),
+        torch.nn.Linear(128, 29),
+    )
 
+    actor_state = {
+        key.removeprefix("actor."): value
+        for key, value in ckpt["model_state_dict"].items()
+        if key.startswith("actor.")
+    }
+    actor.load_state_dict(actor_state, strict=True)
+    normalizer = _FrozenDaggerNormalizer()
+    normalizer.load_state_dict(
+        ckpt["policy_normalizer_state_dict"],
+        strict=True,
+    )
+    actor = actor.to(env.device).eval()
+    normalizer = normalizer.to(env.device).eval()
+    actor.requires_grad_(False)
+    normalizer.requires_grad_(False)
+    env._vault_dagger_reference = {
+        "path": path,
+        "actor": actor,
+        "normalizer": normalizer,
+    }
+    print(f"[Vault Imitation] Frozen DAgger Student loaded: {path}")
+    return actor, normalizer
+
+def vault_dagger_imitation(env, checkpoint_path, sigma=0.5):
+    """Reward the PPO action for matching the frozen DAgger Student."""
+    if sigma <= 0:
+        raise ValueError("sigma must be positive.")
+    # 更新状态机，确保使用当前 step 的状态。
+    s = update(env)
+    # 只在已经进入 Vault、尚未跨越、没有失败的环境启用。
+    vault_mask = (
+        s.has_obstacle
+        & s.vault_started
+        & ~s.crossed
+        & ~s.failed
+    )
+    reward = torch.zeros(
+        env.num_envs,
+        device=env.device,
+        dtype=torch.float32,
+    )
+    if not vault_mask.any():
+        return reward
+    # 获取冻结的 DAgger Actor 和它自己的 Normalizer。
+    teacher_actor, teacher_normalizer = load_vault_dagger_reference(
+        env,
+        checkpoint_path,
+    )
+    # 获取当前已经缓存的原始 policy observation。
+    # 不重新调用 observation_manager，避免重复推进 history。
+    policy_terms = env.obs_buf["policy"]
+    term_names = env.observation_manager.active_terms["policy"]
+    policy_obs = torch.cat(
+        [
+            policy_terms[name].reshape(env.num_envs, -1)
+            for name in term_names
+        ],
+        dim=-1,
+    )
+    # 严格检查观测和动作维度。
+    if policy_obs.shape[-1] != 2049:
+        raise RuntimeError(
+            f"DAgger observation mismatch: {policy_obs.shape[-1]} != 2049"
+        )
+    student_action = env.action_manager.action
+    if student_action.shape[-1] != 29:
+        raise RuntimeError(
+            f"DAgger action mismatch: {student_action.shape[-1]} != 29"
+        )
+    # Teacher 只推理，不参与梯度更新。
+    with torch.no_grad():
+        teacher_action = teacher_actor(
+            teacher_normalizer(policy_obs)
+        )
+        # 对 29 个关节的动作误差取均值。
+        mse = (
+            student_action - teacher_action
+        ).square().mean(dim=-1)
+        # 平滑的模仿奖励，范围为 (0, 1]。
+        imitation = torch.exp(
+            -mse / (2.0 * sigma * sigma)
+        )
+    return imitation * vault_mask.float()
+
+class YawCurriculumVelocityCommand(
+    isaac_mdp.UniformVelocityCommand
+):
+    """G1 yaw curriculum: stand, turn, arc walking, straight walking."""
+
+    def _resample_command(self, env_ids):
+        super()._resample_command(env_ids)
+        n = len(env_ids)
+        if n == 0:
+            return
+        device = self.device
+        # 四种命令的采样概率
+        mode = torch.rand(n, device=device)
+        # 10% 静止站立
+        stand = mode < 0.10
+        # 30% 原地转向
+        turn_in_place = (
+            (mode >= 0.10)
+            & (mode < 0.60)
+        )
+        # 30% 行进转弯
+        turn_while_walking = (
+            (mode >= 0.60)
+            & (mode < 0.80)
+        )
+        # 30% 直线行走
+        straight = mode >= 0.80
+        command = torch.zeros(
+            n, 3, device=device
+        )
+
+        # 正负方向均衡采样
+        yaw_magnitude = torch.empty(
+            n, device=device
+        ).uniform_(0.20, 0.60)
+
+        yaw_sign = torch.where(
+            torch.rand(n, device=device) < 0.5,
+            -1.0,
+            1.0,
+        )
+
+        yaw = yaw_sign * yaw_magnitude
+
+        # 1. 原地转向
+        command[turn_in_place, 0] = 0.0
+        command[turn_in_place, 1] = 0.0
+        command[turn_in_place, 2] = yaw[turn_in_place]
+
+        # 2. 行进中转弯
+        forward_speed = torch.empty(
+            n, device=device
+        ).uniform_(0.30, 1.00)
+
+        command[turn_while_walking, 0] = (
+            forward_speed[turn_while_walking]
+        )
+        command[turn_while_walking, 2] = (
+            yaw[turn_while_walking]
+        )
+
+        # 3. 直线行走，包括前进和后退
+        straight_speed = torch.empty(
+            n, device=device
+        ).uniform_(-0.80, 1.20)
+
+        command[straight, 0] = (
+            straight_speed[straight]
+        )
+
+        # stand 保持三维全零
+        self.vel_command_b[env_ids] = command
 
 def velocity_command(env):
-    command = env.command_manager.get_command("base_velocity")
-    transition = state(env)
-    # Before a vault is completed, keep the approach/vault target fixed at
-    # the teacher's forward speed.  After recovery, preserve the command
-    # written by play.py (including keyboard control).
-    h = transition.has_obstacle & ~transition.completed
-    command[h] = command.new_tensor((env.cfg.transition.forward_command,0.,0.))
+    """
+    Unified locomotion + vault command.
+    No obstacle:
+        use yaw curriculum commands.
+    Obstacle before stable completion:
+        hold forward command for approach,
+        vault and landing recovery.
+    After completion:
+        allow normal velocity commands again.
+    """
+    command = env.command_manager.get_command(
+        "base_velocity"
+    )
+    s = state(env)
+    # 有箱子、尚未完成稳定恢复时，
+    # 保持正常前进指令，避免箱前原地旋转。
+    obstacle_forward = (
+        s.has_obstacle
+        & ~s.completed
+        & ~s.failed
+    )
+    # 这里必须写回 CommandManager 的命令缓冲区，
+    # 使 Actor、速度跟踪奖励和 Recovery 状态机
+    # 读取到一致的目标命令。
+    command[obstacle_forward, 0] = (
+        env.cfg.transition.forward_command
+    )
+    command[obstacle_forward, 1] = 0.0
+    command[obstacle_forward, 2] = 0.0
     return command.clone()
 
 
@@ -227,6 +449,249 @@ def event_reward(env, event):
 
 def dense_reward(env, name):
     return getattr(update(env),name)
+
+def locomotion_reward_mask(env):
+    """Enable normal locomotion rewards outside the active vault phase."""
+    s = update(env)
+    # 平地、接近阶段、跨越后的恢复阶段都开启。
+    # 进入 Vault 后关闭，直到成功跨越。
+    enabled = (
+        ~s.has_obstacle
+        | ~s.vault_started
+        | s.crossed
+        | s.recovery_seed
+    )
+    # 失败状态不再产生普通 locomotion 奖励。
+    enabled &= ~s.failed
+    return enabled.float()
+
+def locomotion_track_lin_vel(env, command_name, std):
+    reward = locomotion_mdp.track_lin_vel_xy_yaw_frame_exp(
+        env,
+        command_name=command_name,
+        std=std,
+    )
+    return reward * locomotion_reward_mask(env)
+
+def locomotion_track_ang_vel(env, command_name, std):
+    reward = locomotion_mdp.track_ang_vel_z_world_exp(
+        env,
+        command_name=command_name,
+        std=std,
+    )
+    return reward * locomotion_reward_mask(env)
+
+def locomotion_stand_still(env, command_name, asset_cfg):
+    """Penalize drift from the default pose only during locomotion phases."""
+    reward = locomotion_mdp.stand_still(
+        env,
+        command_name=command_name,
+        asset_cfg=asset_cfg,
+    )
+    return reward * locomotion_reward_mask(env)
+
+
+def locomotion_feet_air_time(
+    env,
+    command_name,
+    threshold,
+    sensor_cfg,
+):
+    reward = locomotion_mdp.feet_air_time_positive_biped(
+        env,
+        command_name=command_name,
+        threshold=threshold,
+        sensor_cfg=sensor_cfg,
+    )
+    return reward * locomotion_reward_mask(env)
+
+# -------------------------------------------------
+# Unitree OmniLoco upper-body stabilization rewards
+# -------------------------------------------------
+
+def locomotion_upper_body_joint_vel(env, asset_cfg):
+    """Penalize excessive upper-body joint velocity."""
+
+    reward = isaac_mdp.joint_vel_l2(
+        env,
+        asset_cfg=asset_cfg,
+    )
+
+    return reward * locomotion_reward_mask(env)
+
+
+def locomotion_joint_deviation_torso(env, asset_cfg):
+    """Keep waist joints close to their default positions."""
+
+    reward = isaac_mdp.joint_deviation_l1(
+        env,
+        asset_cfg=asset_cfg,
+    )
+
+    return reward * locomotion_reward_mask(env)
+
+
+
+def gait_correction_mask(env):
+    """平地、正常接近、稳定恢复后启用步态修正。"""
+    s = update(env)
+
+    active = (
+        ~s.has_obstacle
+        | (
+            s.has_obstacle
+            & ~s.vault_started
+            & ~s.is_rsi
+        )
+        | s.completed
+    )
+
+    return (active & ~s.failed).float()
+
+
+# def locomotion_feet_gait_masked(
+#     env,
+#     period,
+#     offset,
+#     threshold,
+#     sensor_cfg,
+#     command_name,
+# ):
+#     reward = locomotion_mdp.feet_gait(
+#         env,
+#         period=period,
+#         offset=offset,
+#         threshold=threshold,
+#         sensor_cfg=sensor_cfg,
+#         command_name=command_name,
+#     )
+
+#     s = update(env)
+
+#     # 正常行走、Vault 前接近阶段开启；
+#     # Vault 及其后的恢复阶段暂不使用固定时钟奖励。
+#     mask = (
+#         gait_correction_mask(env)
+#         * (~s.vault_started).float()
+#     )
+
+#     return reward * mask
+def locomotion_feet_gait_masked(
+    env,
+    period,
+    offset,
+    threshold,
+    sensor_cfg,
+    command_name,
+):
+    reward = locomotion_mdp.feet_gait(
+        env,
+        period=period,
+        offset=offset,
+        threshold=threshold,
+        sensor_cfg=sensor_cfg,
+        command_name=command_name,
+    )
+    s = update(env)
+    command = env.command_manager.get_command(command_name)
+    linear_speed = torch.linalg.vector_norm(
+        command[:, :2],
+        dim=-1,
+    )
+    yaw_speed = torch.abs(command[:, 2])
+    # 判断是否为原地转向
+    turn_in_place = (
+        (linear_speed < 0.1)
+        & (yaw_speed > 0.15)
+    )
+    # 原有 Gait Correction Mask 保持不变
+    mask = gait_correction_mask(env)
+    # Vault 阶段关闭固定步态周期
+    mask = mask * (~s.vault_started).float()
+    # 原地转向不强制匹配直线行走的 0.8s 周期
+    mask = mask * (~turn_in_place).float()
+    return reward * mask
+
+def loco_lin_vel_z_penalty(env):
+    reward = isaac_mdp.lin_vel_z_l2(env)
+    return reward * gait_correction_mask(env)
+
+
+def loco_flat_orientation_penalty(env):
+    reward = isaac_mdp.flat_orientation_l2(env)
+    return reward * gait_correction_mask(env)
+
+
+def loco_feet_slide_penalty(env, sensor_cfg, asset_cfg):
+    reward = velocity_mdp.feet_slide(
+        env,
+        sensor_cfg=sensor_cfg,
+        asset_cfg=asset_cfg,
+    )
+    return reward * gait_correction_mask(env)
+
+def locomotion_joint_deviation_arms(env, asset_cfg):
+    """Discourage excessive arm deviation from natural default posture."""
+
+    reward = isaac_mdp.joint_deviation_l1(
+        env,
+        asset_cfg=asset_cfg,
+    )
+
+    return reward * locomotion_reward_mask(env)
+
+def locomotion_feet_symmetry_masked(
+    env, command_name, sensor_cfg,
+    max_time=1.0,
+):
+    reward = locomotion_mdp.feet_air_contact_symmetry_penalty(
+        env,
+        command_name=command_name,
+        sensor_cfg=sensor_cfg,
+        max_time=max_time,
+    )
+    return reward * gait_correction_mask(env)
+
+def turn_in_place_progress_reward(
+    env,
+    command_name="base_velocity",
+):
+    """Encourage actual yaw rotation when commanded to turn in place."""
+    command = env.command_manager.get_command(
+        command_name
+    )
+    linear_speed = torch.linalg.vector_norm(
+        command[:, :2],
+        dim=-1,
+    )
+    target_wz = command[:, 2]
+    # 只用于真正的原地转向指令
+    pivot = (
+        (linear_speed < 0.08)
+        & (torch.abs(target_wz) > 0.15)
+    )
+    robot = env.scene["robot"]
+    actual_wz = robot.data.root_ang_vel_w[:, 2]
+    # 正确方向的实际旋转速度
+    signed_wz = (
+        actual_wz * torch.sign(target_wz)
+    )
+    # 达到目标时得 1；
+    # 完全不旋转得 0；
+    # 反向旋转为负值。
+    progress = signed_wz / torch.abs(
+        target_wz
+    ).clamp_min(0.2)
+    progress = torch.clamp(
+        progress,
+        min=-1.0,
+        max=1.0,
+    )
+    return (
+        progress
+        * pivot.float()
+        * gait_correction_mask(env)
+    )
 
 
 def privileged_observation(env):

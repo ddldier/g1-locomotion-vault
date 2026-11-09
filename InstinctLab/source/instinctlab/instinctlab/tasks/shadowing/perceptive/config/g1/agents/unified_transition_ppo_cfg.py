@@ -17,7 +17,7 @@ class PolicyCfg(InstinctRlActorCriticCfg):
 @configclass
 class AlgorithmCfg(InstinctRlPpoAlgorithmCfg):
     class_name = "WarmStartPPO"
-    critic_only: bool = True
+    critic_only: bool = False                           #明确 Actor 解冻并且训练恢复时使用 --unfreeze_actor
     actor_learning_rate: float = 3e-5
     critic_learning_rate: float = 3e-4
     value_loss_coef = 1.
@@ -48,7 +48,7 @@ class G1UnifiedTransitionPPORunnerCfg(InstinctRlOnPolicyRunnerCfg):
     normalizers: NormalizersCfg = NormalizersCfg()
     num_steps_per_env = 24
     max_iterations = 50
-    save_interval = 10
+    save_interval = 200
     log_interval = 1
     experiment_name = "g1_unified_transition_ppo"
     run_name = "critic_warmup"

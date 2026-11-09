@@ -2,7 +2,6 @@
 
 # 标准库：用于读取环境变量，从而允许通过外部环境覆盖 Teacher checkpoint 路径。
 import os
-from pathlib import Path
 
 # IsaacLab 的配置类装饰器：用于把普通类声明为可组合的配置对象。
 from isaaclab.utils import configclass
@@ -41,18 +40,20 @@ TEACHER_POLICY_TERMS = {
 # 当前 VaultDaggerTPPO 实际只消费 Vault Teacher checkpoint；
 # locomotion Teacher checkpoint 预留给后续 multi-teacher router 使用。
 # 通过环境变量可覆盖默认路径，便于不同实验机器或不同 checkpoint 复用代码。
-_PROJECT_ROOT = Path(__file__).resolve().parents[9]
-
 LOCOMOTION_TEACHER_CHECKPOINT = os.environ.get(
     'LOCOMOTION_TEACHER_CHECKPOINT',
-    str(_PROJECT_ROOT / 'model/teachers/locomotion_pelvis_35000/model_35000.pt'),
+    # 默认 locomotion Teacher checkpoint 路径。
+    '/root/gpufree-data/InstinctLab/logs/instinct_rl/g1_unified_omni_loco_pelvis_rev10/'
+    '20261021_101015_G1UnifiedOmniLocoPelvisRev10_obs623_scale1_stand02_from24000_from20261020_115051/'
+    'model_35000.pt',
 )
 
 # Vault Teacher checkpoint 路径。
 # 当前蒸馏入口主要加载该 checkpoint；同样支持通过 VAULT_TEACHER_CHECKPOINT 环境变量覆盖。
 VAULT_TEACHER_CHECKPOINT = os.environ.get(
     'VAULT_TEACHER_CHECKPOINT',
-    str(_PROJECT_ROOT / 'model/teachers/vault_pelvis_15001/model_15001.pt'),
+    '/root/gpufree-data/InstinctLab/logs/instinct_rl/g1_perceptive_vault_pelvis_corrected/'
+    '20261019_192913_g1PerceptiveVaultPelvisPhpTeacher_concatMotionBins/model_15001.pt',
 )
 
 

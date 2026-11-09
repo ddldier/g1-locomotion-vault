@@ -375,3 +375,4 @@ find /root/gpufree-data/InstinctLab/logs/instinct_rl -name 'model_*.pt' | sort
 | DAgger 算法和 Teacher 路径 | `source/instinctlab/instinctlab/tasks/shadowing/perceptive/config/g1/agents/instinct_rl_vault_dagger_cfg.py` |
 | 模型归档 | `model/` |
 | Vault 数据说明 | `source/instinctlab/instinctlab/tasks/shadowing/XU_VAULT_INTEGRATION.md` |
+

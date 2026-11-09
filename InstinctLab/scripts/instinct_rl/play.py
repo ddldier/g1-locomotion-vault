@@ -2,6 +2,16 @@
 
 # 本脚本用于加载已训练的 Instinct-RL 策略（checkpoint），在 Isaac Sim 中回放/评估。
 # 支持录像、ONNX 导出、键盘控制、以及针对特定混合任务（Vault/移动）的定制化 Play 配置。
+#
+# 整体流程概览：
+#   1. 解析命令行参数（任务名、checkpoint、是否录像、是否导出 ONNX、键盘控制等）。
+#   2. 启动 Isaac Sim 应用（AppLauncher）。
+#   3. 解析环境配置 env_cfg 与智能体配置 agent_cfg。
+#   4. 根据 checkpoint 路径加载策略网络；或使用 --no_resume 使用随机初始化模型。
+#   5. 针对某些特定任务（如 Unified-Height-Play-G1）修改回放配置（关闭噪声、固定起点等）。
+#   6. 创建 gym 环境，按需包装录像、VecEnv、OnPolicyRunner。
+#   7. 加载策略并进入主循环：键盘命令 -> 观测 -> 策略推理 -> 环境步进 -> 循环。
+#   8. 按需打印 Vault 环境终止信息、辅助奖励调试信息、导出 ONNX、录像等。
 
 """Launch Isaac Sim Simulator first."""
 
@@ -17,35 +27,23 @@ import cli_args  # isort: skip
 # add argparse arguments
 # ============ 命令行参数定义 ============
 parser = argparse.ArgumentParser(description="Play an RL agent with Instinct-RL.")
-# 是否录制视频
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
-# 录制视频长度（步数）
 parser.add_argument("--video_length", type=int, default=3000, help="Length of the recorded video (in steps).")
-# 开始录制视频的步数
 parser.add_argument("--video_start_step", type=int, default=0, help="Start step for the simulation.")
-# 禁用 fabric，改为 USD I/O（某些场景需要）
 parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
-# 并行环境数量（覆盖默认配置）
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
-# 任务名称（IsaacLab/InstinctLab 注册的任务 ID）
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
-# 是否将策略导出为 ONNX（仅支持单环境）
 parser.add_argument("--exportonnx", action="store_true", default=False, help="Export policy as ONNX model.")
-# 是否启用 debugpy 远程调试
 parser.add_argument("--debug", action="store_true", default=False, help="Enable debug mode.")
-# 强制不加载 checkpoint，使用随机初始化的模型
 parser.add_argument("--no_resume", default=None, action="store_true", help="Force play in no resume mode.")
-# 是否启用键盘覆盖 base_velocity 命令
 parser.add_argument("--keyboard", action="store_true", help="Override base velocity with keyboard input.")
-# 键盘控制的前后/侧向速度步长
-parser.add_argument("--keyboard_linvel_step", type=float, default=1.0, help="Keyboard forward/lateral speed in m/s.")
-# 键盘控制的偏航角速度步长
-parser.add_argument("--keyboard_angvel", type=float, default=1.0, help="Keyboard yaw speed in rad/s.")
-# 键盘速度命令平滑过渡时间（秒）
+parser.add_argument("--manual_reset_only", action="store_true")
+parser.add_argument("--keyboard_linvel_step", type=float, default=1.5, help="Keyboard forward/lateral speed in m/s.")
+parser.add_argument("--keyboard_angvel", type=float, default=1.5, help="Keyboard yaw speed in rad/s.")
 parser.add_argument(
-    "--keyboard_ramp_time", type=float, default=0.1,
+    "--keyboard_ramp_time", type=float, default=0.5,
     help="Seconds used to smoothly reach a new keyboard velocity command.",
 )
 
@@ -53,13 +51,9 @@ parser.add_argument(
 # ============ 自定义 Play 参数 ============
 # 是否从文件加载 env 配置
 parser.add_argument("--env_cfg", action="store_true", default=False, help="Load configuration from file.")
-# 是否从文件加载 agent 配置
 parser.add_argument("--agent_cfg", action="store_true", default=False, help="Load configuration from file.")
-# 是否从策略输出分布采样动作（而不是用确定性动作）
 parser.add_argument("--sample", action="store_true", default=False, help="Sample actions instead of using the policy.")
-# 前 N 步将动作置零（便于观察初始状态）
 parser.add_argument("--zero_act_until", type=int, default=0, help="Zero actions until this timestep.")
-# 是否不终止（仅保留 dataset_exhausted 终止项）
 parser.add_argument(
     "--no_terminate", action="store_true", default=False, help="Do not remove termination conditions in simulation."
 )
@@ -114,79 +108,77 @@ if args_cli.debug:
     ip_address = ("0.0.0.0", 6789)
     print("Process: " + " ".join(sys.argv[:]))
     print("Is waiting for attach at address: %s:%d" % ip_address, flush=True)
+    # 启动 debugpy 监听并阻塞，等待客户端（如 VS Code）连接
     debugpy.listen(ip_address)
     debugpy.wait_for_client()
     debugpy.breakpoint()
 
 
 def fix_vault_play_command(env):
-    """Keep only mixed-task Vault commands at body-forward (1, 0, 0)."""
-    # 说明：针对混合任务（locomotion + Vault）中的 Vault 环境，
-    # 强制其 base_velocity 命令保持为 (vx, vy, wz) = (1, 0, 0)，
-    # 避免随机采样导致 Vault 环境无法触发跳跃动作。
+    """Dynamic per-env Vault command switching."""
 
     raw_env = env.unwrapped
+
+    # Unified Transition task
+    if hasattr(raw_env.cfg, "transition"):
+
+        from instinctlab.tasks.shadowing.perceptive.config.g1 import (
+            unified_transition_mdp as transition_mdp,
+        )
+
+        velocity_term = raw_env.command_manager.get_term("base_velocity")
+
+        def get_vault_mask():
+            s = transition_mdp.state(raw_env)
+
+            return (
+                s.has_obstacle
+                & ~s.completed
+                & ~s.failed
+            )
+
+        def enforce():
+            mask = get_vault_mask()
+            command = velocity_term.command
+
+            command[mask, 0] = raw_env.cfg.transition.forward_command
+            command[mask, 1:] = 0.0
+
+        enforce()
+
+        print("[INFO] Unified Transition command switching enabled.")
+        print("[INFO] Vault envs: fixed forward command.")
+        print("[INFO] Other envs: keyboard command.")
+
+        return get_vault_mask, enforce
+
+    # Keep original dual-task behavior
     observations = getattr(raw_env.cfg, "observations", None)
     critic = getattr(observations, "critic", None)
     task_term = getattr(critic, "task_id", None)
     task_func = getattr(task_term, "func", None)
 
-    # 仅当 critic 观测里有名为 dual_task_id 的任务 ID 函数时才应用此修复
-    # Only apply this fix to the existing mixed locomotion/Vault environment.
     if getattr(task_func, "__name__", None) != "dual_task_id":
         return None, None
 
-    # 通过 task_func 获取每个环境是否是 Vault（0 列 > 0.5 视为 Vault）
     vault_mask = task_func(raw_env)[:, 0] > 0.5
 
-    # 若无 Vault 环境，打印提示并跳过
     if not bool(vault_mask.any()):
-        print("[INFO] This mixed-task playback contains only locomotion environments.")
-        return vault_mask, None
+        return lambda: vault_mask, None
 
-    # 获取 base_velocity 命令管理器 term
     velocity_term = raw_env.command_manager.get_term("base_velocity")
 
+    def get_vault_mask():
+        return vault_mask
+
     def enforce():
-        # 将 Vault 环境的命令固定为前进 1 m/s，其余分量清零
         command = velocity_term.command
         command[vault_mask, 0] = 1.0
         command[vault_mask, 1:] = 0.0
 
-        # 禁止 standing/heading 逻辑对 Vault 命令的覆盖
-        # Prevent standing/heading overrides from changing Vault commands.
-        for name in ("is_standing_env", "is_heading_env"):
-            flags = getattr(velocity_term, name, None)
-            if flags is not None:
-                flags[vault_mask] = False
-
-    # 保存原始方法以便包装
-    original_resample = velocity_term._resample_command
-    original_update = velocity_term._update_command
-
-    def resample(env_ids):
-        # 先执行原采样逻辑，然后对 Vault 环境强制命令
-        original_resample(env_ids)
-        enforce()
-
-    def update():
-        # 先执行原更新逻辑，然后对 Vault 环境强制命令
-        original_update()
-        enforce()
-
-    # 用包装函数替换原始方法
-    # Preserve the original locomotion sampling and updates, then fix only
-    # Vault rows before observations and debug arrows read the command buffer.
-    velocity_term._resample_command = resample
-    velocity_term._update_command = update
-
-    # 立即执行一次以保证首个 step 前命令已正确
     enforce()
 
-    print("[INFO] Vault playback command: body-frame (vx, vy, wz) = (1, 0, 0).")
-    print("[INFO] Locomotion commands remain unchanged; keyboard control targets locomotion only.")
-
-    return vault_mask, enforce
+    return get_vault_mask, enforce
 
 
 def main():
@@ -198,6 +190,28 @@ def main():
         num_envs=args_cli.num_envs,
         use_fabric=not args_cli.disable_fabric,
     )
+    # Unified Transition PLAY overrides must stay task-scoped. Legacy tasks such
+    # as Unified Height do not define `transition` on their environment config.
+    if args_cli.task == "Instinct-Unified-Transition-PPO-Play-G1-v0":
+        if not hasattr(env_cfg, "transition"):
+            raise RuntimeError(
+                "Unified Transition PLAY config has no transition settings."
+            )
+
+        # Every episode must contain a box.
+        env_cfg.transition.obstacle_probability = 1.0
+
+        # Always start from normal locomotion state, not RSI.
+        env_cfg.transition.rsi_probability = 0.0
+        env_cfg.transition.distances = (1.5, 2.2)
+
+        env_cfg.transition.validate()
+
+        print(
+            "[INFO] Unified Transition PLAY:"
+            " obstacle_probability=1.0,"
+            " rsi_probability=0.0"
+        )
     # 解析 agent 配置（Instinct-RL runner 相关）
     agent_cfg: InstinctRlOnPolicyRunnerCfg = cli_args.parse_instinct_rl_cfg(
         args_cli.task, args_cli
@@ -210,23 +224,37 @@ def main():
     agent_cfg.load_run = args_cli.load_run
 
     # ============ 确定 checkpoint 路径 ============
+    # 用户可能通过 --load_run 指定运行目录或具体 checkpoint 文件；
+    # 也可能用 --no_resume 表示从随机初始化模型开始（用于对比/调试）。
     if agent_cfg.load_run is not None:
         print(f"[INFO] Loading experiment from directory: {log_root_path}")
+        # Normalize absolute run paths so a trailing slash cannot turn the
+        # basename into an empty string during checkpoint lookup.
+        agent_cfg.load_run = os.path.normpath(os.path.expanduser(agent_cfg.load_run))
 
-        if os.path.isabs(agent_cfg.load_run):
-            # 绝对路径：直接拆分目录与文件名
-            resume_path = get_checkpoint_path(
-                os.path.dirname(agent_cfg.load_run),
-                os.path.basename(agent_cfg.load_run),
-                agent_cfg.load_checkpoint,
+        try:
+            if os.path.isabs(agent_cfg.load_run):
+                # 绝对路径：直接拆分目录与文件名
+                resume_path = get_checkpoint_path(
+                    os.path.dirname(agent_cfg.load_run),
+                    os.path.basename(agent_cfg.load_run),
+                    agent_cfg.load_checkpoint,
+                )
+            else:
+                # 相对路径：以 log_root_path 为基准
+                resume_path = get_checkpoint_path(
+                    log_root_path,
+                    agent_cfg.load_run,
+                    agent_cfg.load_checkpoint,
+                )
+        except Exception as exc:
+            print(
+                f"[ERROR] Checkpoint lookup failed: run={agent_cfg.load_run!r}, "
+                f"checkpoint={agent_cfg.load_checkpoint!r}: {type(exc).__name__}: {exc}",
+                flush=True,
             )
-        else:
-            # 相对路径：以 log_root_path 为基准
-            resume_path = get_checkpoint_path(
-                log_root_path,
-                agent_cfg.load_run,
-                agent_cfg.load_checkpoint,
-            )
+            raise
+        print(f"[INFO] Resolved checkpoint: {resume_path}", flush=True)
 
         # log_dir 为 checkpoint 所在目录
         log_dir = os.path.dirname(resume_path)
@@ -256,6 +284,13 @@ def main():
 
     # 仅针对 "Instinct-Unified-Height-Play-G1-v0" 任务做专门的回放设置
     # Diagnostic settings for the height Student playback task only.
+    # 该任务属于混合任务：偶数 id 为 locomotion 环境，奇数 id 为 Vault 环境。
+    # 回放时需要：
+    #   - Vault 环境使用无噪声的固定 reset；
+    #   - 关闭 policy 观测噪声；
+    #   - 固定 motion reference 起始帧，关闭中间起点随机化；
+    #   - 关闭与位置相关的终止项，避免 Vault 回放时被误判终止；
+    #   - 调整箱体位置偏移 play_box_dx，使箱体更靠近机器人。
     if args_cli.task == "Instinct-Unified-Height-Play-G1-v0":
         import instinctlab.envs.mdp as instinct_mdp
 
@@ -302,18 +337,19 @@ def main():
         # )
         # if noise_test not in (*noise_terms, "none", "all"):
         #     raise ValueError(f"Unknown noise_test: {noise_test}")ssssssss
-
+        
+        # 关闭 policy 观测的噪声
         policy_cfg = env_cfg.observations.policy
         policy_cfg.enable_corruption = False #noise_test != "none"
-
+        
         # for term_name in noise_terms:
         #     term_cfg = getattr(policy_cfg, term_name)
         #     if noise_test not in (term_name, "all"):
         #         term_cfg.noise = None
-
+        
         # print(f"[INFO] PLAY policy noise: {noise_test}")
 
-        # 关闭 policy 观测的噪声
+        # 关闭 policy 观测的噪声（再次设置，保持原代码行为）
         policy_cfg = env_cfg.observations.policy
         policy_cfg.enable_corruption = None
 
@@ -329,13 +365,14 @@ def main():
         env_cfg.terminations.base_pg_too_far = None
         print("[INFO] Fixed Vault PLAY: start=0, reset_noise=off, policy_noise=off")
 
-        #zhi xiu gai play de shi hou de pei zhi
+        #zhi xiu gai play de shi hou de pei zhi 
         # 仅修改 play 时的配置（从 vault_play 读取原始箱体位置）
         from instinctlab.tasks.shadowing.perceptive.config.g1 import perceptive_vault_cfg as vault_play
 
         # 负值：箱体沿 -x 移动，靠近当前从 +x 方向接近它的机器人。
         play_box_dx = -1
 
+        # 读取原始箱体位置
         box_x, box_y, box_z = vault_play.vault_cfg.VAULT_BOX_POS
         original_reset_box = env_cfg.events.reset_vault_box.func
 
@@ -362,6 +399,49 @@ def main():
         print(f"[INFO] PLAY box x offset: {play_box_dx:+.2f} m")
 
     # 创建环境（如需录像则使用 rgb_array 渲染模式）
+
+    if args_cli.manual_reset_only:
+        if not args_cli.keyboard:
+            raise RuntimeError(
+                "--manual_reset_only requires --keyboard"
+            )
+        if args_cli.task != (
+            "Instinct-Unified-Transition-PPO-Play-G1-v0"
+        ):
+            raise RuntimeError(
+                "Manual reset supports Transition PLAY only"
+            )
+        if not hasattr(env_cfg, "terminations"):
+            raise RuntimeError(
+                "Use the normal Play config, not --env_cfg"
+            )
+
+        original_failure = env_cfg.terminations.failure.func
+
+        def failure_without_reset(play_env):
+            # Keep updating the Transition state.
+            original_failure(play_env)
+            return torch.zeros(
+                play_env.num_envs,
+                dtype=torch.bool,
+                device=play_env.device,
+            )
+
+        def timeout_without_reset(play_env):
+            return torch.zeros(
+                play_env.num_envs,
+                dtype=torch.bool,
+                device=play_env.device,
+            )
+
+        env_cfg.terminations.failure.func = failure_without_reset
+        env_cfg.terminations.time_out.func = timeout_without_reset
+
+        print(
+            "[PLAY] AUTO RESET DISABLED - PRESS R TO RESET",
+            flush=True,
+        )
+
     env = gym.make(
         args_cli.task,
         cfg=env_cfg,
@@ -369,6 +449,7 @@ def main():
     )
 
     # ============ 视频录制包装 ============
+    # 使用 gym 的 RecordVideo wrapper 在指定步数开始录制，录制到 log_dir/videos/play
     if args_cli.video:
         video_kwargs = {
             "video_folder": os.path.join(log_dir, "videos", "play"),
@@ -387,9 +468,13 @@ def main():
 
     # 在 wrapper 和 runner reset 环境之前安装 Vault 命令修正
     # Install before the wrapper and runner reset the environment.
+    # 该函数会根据任务类型返回 (vault_mask, enforce_vault_command)：
+    #   - vault_mask：函数，返回布尔张量，标记哪些环境是 Vault 环境；
+    #   - enforce_vault_command：函数，把 Vault 环境命令强制为 (1,0,0)。
     vault_mask, enforce_vault_command = fix_vault_play_command(env)
 
     # --no_terminate：只保留 dataset_exhausted 终止项，其他终止条件全部去除
+    # 这样回放时不会被“摔倒/位置偏差”等终止条件打断，便于观察完整动作
     if args_cli.no_terminate:
         manager = env.unwrapped.termination_manager
         index = manager._term_names.index("dataset_exhausted")
@@ -415,6 +500,7 @@ def main():
     # --sample：从分布采样动作；否则使用确定性推理策略
     if args_cli.sample:
         ppo_runner.eval_mode()
+        # 获取 policy 观测的 normalizer（若存在），采样前需要先对观测做归一化
         normalizer = ppo_runner.normalizers.get("policy")
 
         def policy(observations):
@@ -424,9 +510,11 @@ def main():
             return ppo_runner.alg.actor_critic.act(observations)
 
     else:
+        # 确定性推理：直接取 actor 输出的均值动作
         policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
 
     # ============ 导出 ONNX ============
+    # ONNX 导出仅支持单环境，便于后续在 C++/Python 推理引擎中加载
     if agent_cfg.load_run is not None and args_cli.exportonnx:
         assert env.unwrapped.num_envs == 1, (
             "Exporting to ONNX is only supported for single environment."
@@ -445,15 +533,28 @@ def main():
 
     # ============ 键盘控制相关状态 ============
     # 当前键盘命令（平滑后的值）与目标值
+    # 三个维度依次为：前向速度、侧向速度、偏航角速度
     keyboard_command = torch.zeros(
         (env.unwrapped.num_envs, 3),
         device=env.unwrapped.device,
     )
     keyboard_command_target = torch.zeros_like(keyboard_command)
+    manual_reset_requested = False
 
     if args_cli.keyboard:
         # 键盘事件回调：按下/重复按下时更新目标命令
         def on_keyboard_input(event):
+
+            nonlocal manual_reset_requested
+
+            if (
+                args_cli.manual_reset_only
+                and event.input == carb.input.KeyboardInput.R
+            ):
+                if event.type == KeyboardEventType.KEY_PRESS:
+                    manual_reset_requested = True
+                return
+            # 只处理按下和重复按下事件
             if event.type not in (
                 KeyboardEventType.KEY_PRESS,
                 KeyboardEventType.KEY_REPEAT,
@@ -462,14 +563,17 @@ def main():
 
             key = event.input
 
+            # W/S：前后速度
             if key == carb.input.KeyboardInput.W:
                 keyboard_command_target[:, 0] = args_cli.keyboard_linvel_step
             elif key == carb.input.KeyboardInput.S:
                 keyboard_command_target[:, 0] = -args_cli.keyboard_linvel_step
+            # A/D：侧向速度（注意符号约定：A 为正，D 为负）
             elif key == carb.input.KeyboardInput.A:
                 keyboard_command_target[:, 1] = args_cli.keyboard_linvel_step
             elif key == carb.input.KeyboardInput.D:
                 keyboard_command_target[:, 1] = -args_cli.keyboard_linvel_step
+            # Q/E：偏航角速度
             elif key == carb.input.KeyboardInput.Q:
                 keyboard_command_target[:, 2] = args_cli.keyboard_angvel
             elif key == carb.input.KeyboardInput.E:
@@ -502,8 +606,49 @@ def main():
     )
     while simulation_app.is_running():
         with torch.inference_mode():
+
+            if (
+                args_cli.manual_reset_only
+                and manual_reset_requested
+            ):
+                manual_reset_requested = False
+
+                keyboard_command.zero_()
+                keyboard_command_target.zero_()
+
+                obs, _ = env.reset()
+                episode_steps.zero_()
+
+                if enforce_vault_command is not None:
+                    enforce_vault_command()
+
+                raw_env = env.unwrapped
+
+                if (
+                    hasattr(raw_env, "obs_buf")
+                    and isinstance(
+                        raw_env.obs_buf.get("policy"), dict
+                    )
+                ):
+                    term_cfg = (
+                        raw_env.cfg.observations.policy.velocity_command
+                    )
+                    raw_env.obs_buf["policy"]["velocity_command"] = (
+                        term_cfg.func(
+                            raw_env, **term_cfg.params
+                        )
+                    )
+                    obs, _ = env.get_observations()
+
+                print(
+                    "[PLAY] Manual reset by R",
+                    flush=True,
+                )
+                continue
+
             if args_cli.keyboard:
                 # 键盘命令平滑：alpha 由 step_dt / ramp_time 决定
+                # alpha 越大，命令越快逼近目标值；alpha=1 表示无平滑
                 alpha = min(
                     1.0,
                     env.unwrapped.step_dt
@@ -519,24 +664,37 @@ def main():
                 )
 
                 if vault_mask is None:
-                    # 无 Vault 环境：全部用键盘命令
                     command[:] = keyboard_command
-                else:
-                    # 有 Vault 环境：仅对 locomotion 环境写入键盘命令
-                    command[~vault_mask] = keyboard_command[~vault_mask]
 
-                # Vault 环境命令保持为 (1,0,0)
+                else:
+                    # 每个 policy step 都重新判断当前 Vault 状态
+                    current_vault_mask = vault_mask()
+
+                    # 非 Vault 环境由键盘控制
+                    command[~current_vault_mask] = (
+                        keyboard_command[~current_vault_mask]
+                    )
+
+                # Vault 环境强制使用固定前进命令
                 if enforce_vault_command is not None:
                     enforce_vault_command()
 
                 # 注意：这一行代码存在语法错误（缺少冒号），
                 # 但保持原样不修改。
                 # Read observations after writing this step's keyboard command.
-                if args_cli.task == "Instinct-Unified-Height-Play-G1-v0":
+                # 对于 Unified-Height-Play-G1 任务，需要手动刷新 policy 观测中的
+                # velocity_command，使其与刚写入的命令保持一致
+                if args_cli.task in (
+                    "Instinct-Unified-Height-Play-G1-v0",
+                    "Instinct-Unified-Transition-PPO-Play-G1-v0",
+                ):
                     raw_env = env.unwrapped
-                    term_cfg = raw_env.cfg.observations.policy.velocity_command
-                    raw_env.obs_buf["policy"]["velocity_command"] = term_cfg.func(raw_env, **term_cfg.params)
-
+                    term_cfg = (
+                        raw_env.cfg.observations.policy.velocity_command
+                    )
+                    raw_env.obs_buf["policy"]["velocity_command"] = (
+                        term_cfg.func(raw_env, **term_cfg.params)
+                    )
                 # 写入命令后重新获取观测，使速度命令观测与最新命令一致
                 obs, _ = env.get_observations()
 
@@ -553,6 +711,7 @@ def main():
             manager = env.unwrapped.termination_manager
 
             # 对于 Vault 环境（奇数 id）发生 done 时，打印终止原因和步数
+            # 便于调试 Vault 动作是否完成、在第几秒终止等
             for env_id in dones.nonzero(as_tuple=True)[0].tolist():
                 # 当前混合任务：奇数环境为 Vault
                 if env_id % 2 == 1:
@@ -569,11 +728,13 @@ def main():
                     )
 
             # 已 done 的环境步数清零
-            episode_steps[dones.bool()] = 0
+            episode_steps[dones.bool()] = 0            
 
         timestep += 1
 
         # ============ 辅助奖励：用于调试各奖励项贡献 ============
+        # 把 runner 计算出的辅助奖励写回对应 reward term 的 buffer 中，
+        # 便于在可视化/日志中查看每个奖励项的实际贡献。
         if args_cli.aux_reward:
             aux_rewards = ppo_runner.alg.compute_auxiliary_reward(
                 infos["observations"]

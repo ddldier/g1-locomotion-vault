@@ -35,7 +35,9 @@ class TransitionSceneCfg(InteractiveSceneCfg):
         prim_path="/World/ground",terrain_type="plane",collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(static_friction=1.,dynamic_friction=1.,restitution=0.),
         debug_vis=False)
+    
     robot = G1_29DOF_REV10_PELVIS_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    
     vault_box = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/VaultBox",
         spawn=sim_utils.MeshCuboidCfg(
@@ -45,17 +47,20 @@ class TransitionSceneCfg(InteractiveSceneCfg):
             physics_material=sim_utils.RigidBodyMaterialCfg(static_friction=1.,dynamic_friction=1.),
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.12,0.55,0.65))),
         init_state=RigidObjectCfg.InitialStateCfg(pos=BOX_POS))
+    
     contact_forces = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/.*",history_length=3,track_air_time=True)
     # One source body with multiple partner filters (PhysX one-to-many contract).
     box_contacts = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/VaultBox",history_length=1,
         filter_prim_paths_expr=["{ENV_REGEX_NS}/Robot/"+name for name in task_mdp.BOX_FILTER_BODIES])
+    
     student_height_scanner = MultiMeshRayCasterCfg(
         prim_path="{ENV_REGEX_NS}/Robot/pelvis",update_period=0.02,
         offset=RayCasterCfg.OffsetCfg(pos=(0.,0.,20.)),ray_alignment="yaw",
         pattern_cfg=patterns.GridPatternCfg(resolution=0.1,size=(3.,1.6)),
         mesh_prim_paths=["/World/ground",MultiMeshRayCasterCfg.RaycastTargetCfg(
-            prim_expr="/World/envs/env_.*/VaultBox",track_mesh_transforms=True)],debug_vis=False)
+            prim_expr="/World/envs/env_.*/VaultBox",track_mesh_transforms=True)],debug_vis=True)
+    
     sky_light = AssetBaseCfg(prim_path="/World/skyLight",spawn=sim_utils.DomeLightCfg(intensity=850.))
 
 
@@ -68,10 +73,21 @@ class ActionsCfg:
 @configclass
 class CommandsCfg:
     base_velocity = mdp.UniformVelocityCommandCfg(
-        asset_name="robot",resampling_time_range=(10.,10.),rel_standing_envs=0.0,
-        rel_heading_envs=0.,heading_command=False,debug_vis=False,
-        ranges=mdp.UniformVelocityCommandCfg.Ranges(lin_vel_x=(-1.,1.5),lin_vel_y=(0.,0.),ang_vel_z=(0.,0.)))
-
+        class_type=task_mdp.YawCurriculumVelocityCommand,
+        asset_name="robot",
+        # 每 4～6 秒更换一个目标命令
+        resampling_time_range=(4.0, 6.0),
+        # 站立样本由自定义采样器提供
+        rel_standing_envs=0.0,
+        rel_heading_envs=0.0,
+        heading_command=False,
+        debug_vis=False,
+        ranges=mdp.UniformVelocityCommandCfg.Ranges(
+            lin_vel_x=(-1.0, 1.5),
+            lin_vel_y=(0.0, 0.0),
+            ang_vel_z=(-0.6, 0.6),
+        ),
+    )
 
 @configclass
 class PolicyObsCfg(ObsGroup):
@@ -119,16 +135,150 @@ class EventsCfg:
 
 @configclass
 class RewardsCfg:
-    cross = RewTerm(func=task_mdp.event_reward,weight=20.,params={"event":"cross_event"})
-    complete = RewTerm(func=task_mdp.event_reward,weight=30.,params={"event":"complete_event"})
-    failure = RewTerm(func=task_mdp.event_reward,weight=-20.,params={"event":"failure_event"})
-    approach = RewTerm(func=task_mdp.dense_reward,weight=2.,params={"name":"approach_rate"})
-    progress = RewTerm(func=task_mdp.dense_reward,weight=1.,params={"name":"progress_rate"})
-    speed = RewTerm(func=task_mdp.dense_reward,weight=0.5,params={"name":"speed_reward"})
-    action_rate = RewTerm(func=mdp.action_rate_l2,weight=-0.01)
-    torques = RewTerm(func=mdp.joint_torques_l2,weight=-4e-6)
-    joint_limits = RewTerm(func=mdp.joint_pos_limits,weight=-0.2)
+    # A. Normal Locomotion Rewards
+    loco_track_lin_vel = RewTerm(func=task_mdp.locomotion_track_lin_vel, weight=1.0, params={"command_name": "base_velocity", "std": 0.5})
+    loco_track_ang_vel = RewTerm(func=task_mdp.locomotion_track_ang_vel, weight=1.0, params={"command_name": "base_velocity", "std": 0.5})
+    loco_stand_still = RewTerm(
+        func=task_mdp.locomotion_stand_still,
+        weight=-0.8,
+        params={
+            "command_name": "base_velocity",
+            "asset_cfg": SceneEntityCfg("robot"),
+        },
+    )
+    loco_feet_air_time = None
+    loco_upper_body_joint_vel = RewTerm(
+        func=task_mdp.locomotion_upper_body_joint_vel,
+        weight=-3.0e-5,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=[
+                    "waist_.*",
+                    ".*_shoulder_.*",
+                    ".*_elbow_joint",
+                    ".*_wrist_.*",
+                ],
+            )
+        },
+    )
+    # Gait Correction V1
 
+    loco_lin_vel_z = RewTerm(
+        func=task_mdp.loco_lin_vel_z_penalty,
+        weight=-0.3,
+    )
+
+    loco_flat_orientation = RewTerm(
+        func=task_mdp.loco_flat_orientation_penalty,
+        weight=-0.5,
+    )
+
+    loco_feet_slide = RewTerm(
+        func=task_mdp.loco_feet_slide_penalty,
+        weight=-0.1,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=".*_ankle_roll_link",
+            ),
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=".*_ankle_roll_link",
+            ),
+        },
+    )
+    loco_joint_deviation_torso = RewTerm(
+        func=task_mdp.locomotion_joint_deviation_torso,
+        weight=-0.15,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names="waist_.*",
+            )
+        },
+    )
+
+    loco_joint_deviation_arms = RewTerm(
+        func=task_mdp.locomotion_joint_deviation_arms,
+        weight=-0.15,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=[
+                    ".*_shoulder_pitch_joint",
+                    ".*_shoulder_roll_joint",
+                    ".*_shoulder_yaw_joint",
+                    ".*_elbow_joint",
+                    ".*_wrist_roll_joint",
+                    ".*_wrist_pitch_joint",
+                    ".*_wrist_yaw_joint",
+                ],
+            )
+        },
+    )
+    loco_feet_gait = RewTerm(
+    func=task_mdp.locomotion_feet_gait_masked,
+    weight=0.25,
+    params={
+        "period": 0.8,
+        "offset": [0.0, 0.5],
+        "threshold": 0.55,
+        "command_name": "base_velocity",
+        "sensor_cfg": SceneEntityCfg(
+            "contact_forces",
+            body_names=[
+                "left_ankle_roll_link",
+                "right_ankle_roll_link",
+            ],
+            preserve_order=True,
+        ),
+    },)
+    loco_feet_symmetry = RewTerm(
+        func=task_mdp.locomotion_feet_symmetry_masked,
+        weight=-0.25,
+        params={
+            "command_name": "base_velocity",
+            "max_time": 1.0,
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces",
+                body_names=[
+                    "left_ankle_roll_link",
+                    "right_ankle_roll_link",
+                ],
+                preserve_order=True,
+            ),
+        },
+    )
+    # Pivot Turning V2
+    loco_turn_progress = RewTerm(
+        func=task_mdp.turn_in_place_progress_reward,
+        weight=2.0,
+        params={
+            "command_name": "base_velocity",
+        },
+    )
+    # B. Vault Task Rewards
+    cross = RewTerm(func=task_mdp.event_reward, weight=10, params={"event": "cross_event"})
+    complete = RewTerm(func=task_mdp.event_reward, weight=20, params={"event": "complete_event"})
+    failure = RewTerm(func=task_mdp.event_reward, weight=-10, params={"event": "failure_event"})
+    approach = RewTerm(func=task_mdp.dense_reward, weight=1, params={"name": "approach_rate"})
+    progress = RewTerm(func=task_mdp.dense_reward, weight=0.2, params={"name": "progress_rate"})
+    speed = RewTerm(func=task_mdp.dense_reward, weight=0, params={"name": "speed_reward"})
+    # D. Frozen DAgger Vault Imitation
+
+    vault_dagger_imitation = RewTerm(
+        func=task_mdp.vault_dagger_imitation,
+        weight=4.0,
+        params={
+            "checkpoint_path": "/root/gpufree-data/InstinctLab/logs/instinct_rl/g1_loco_vault_unified_height_dagger/student_model/history/model_15000.pt",
+            "sigma": 0.5,
+        },
+    )# yi hou yao shi huan mo xing ji de gai lu jing
+    # C. Global Regularization
+    action_rate = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
+    torques = RewTerm(func=mdp.joint_torques_l2, weight=-4e-6)
+    joint_limits = RewTerm(func=mdp.joint_pos_limits, weight=-0.2)
 
 @configclass
 class TerminationsCfg:
@@ -155,6 +305,10 @@ class G1UnifiedTransitionEnvCfg(InstinctLabRLEnvCfg):
                                   origin_type="asset_root",asset_name="robot")
 
     def __post_init__(self):
+        # Yaw Curriculum V1：仅限第一阶段平地转向训练
+        self.transition.obstacle_probability = 0.8
+        self.transition.rsi_probability = 0.6
+
         self.transition.validate()
         self.decimation = 4
         self.sim.dt = 0.005
