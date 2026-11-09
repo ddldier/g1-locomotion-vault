@@ -120,3 +120,8 @@ the development history and checkpoint provenance.
   those license files and asset provenance before reuse.
 
 This repository does not include the Isaac Lab or Isaac Sim source trees.
+
+## Locomotion and Vault Videos
+
+- [Video 1](loco_vault_video_01.mp4)
+- [Video 2](loco_vault_video_02.webm)
